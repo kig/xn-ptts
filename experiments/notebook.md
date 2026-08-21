@@ -181,6 +181,26 @@ Prod: deploy/models swapped to 2026-04 model + state voices; compose adds
 `precomputed state` sessions (eponine/alba requests) + `postprocess
 ms=10-17` per utterance; end-to-end probe via paperradio-backend OK.
 
+## Post-process removal + token chunking (2026-08-21)
+Production listening found the post-process pipeline harmful and removed:
+- **Loudness normalization**: overboosted quiet material; clipped sibilants
+  (peak pinned at limiter ceiling 1.0).
+- **Denoising**: unnecessary with the 2026-04 state voices.
+- **Limiter**: existed only to cap the boost; gone with it.
+`ptts::postprocess` deleted (git history keeps it); ws-server flags removed.
+
+Long-text chunking added instead: texts > `--max-tokens-per-chunk` (default
+150) are split into sentence-aligned chunks (mirroring pip; oversized
+sentences sub-split on `,;:`). A/B on a 433-token complex paragraph:
+
+| config | duration | noise floor | glitches | peak |
+|---|---|---|---|---|
+| old (no chunk + postprocess) | 146.4s | **-40.5 dB** | 1 | 1.00 (limiter) |
+| new (chunked, raw) | **78.8s** | **-61.6 dB** | 0 | 0.85 |
+
+Verified in prod through the backend network (78.8s clean; zero postprocess
+log lines).
+
 ## Roadmap
 - **Speech post-processing (requested):** volume normalization + denoising on all
   speech outputs to prevent loud/quiet and noise pumping between utterances.

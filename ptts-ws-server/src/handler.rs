@@ -290,29 +290,43 @@ async fn generate_one<Q: xn::BackendQ>(
 ) -> Result<()> {
     use base64::Engine;
 
-    let (prepared, frames_after_eos) = ptts::tts_model::prepare_text_prompt(text);
-    let tokens = app.model.flow_lm.conditioner.tokenize(&prepared)?;
-    let state = base_state.clone();
-    let model = Arc::clone(&app.model);
-    let temperature = app.temperature;
-    let seed = app.seed_base ^ (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
-
-    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
-    let join = tokio::task::spawn_blocking(move || {
-        generate_chunks(model, state, tokens, temperature, seed, frames_after_eos, audio_tx)
-    });
-
-    // With post-processing enabled, buffer the whole utterance, process it
-    // (denoise -> normalize -> limit), then emit; otherwise stream chunks as
-    // they are decoded.
-    let post = app.postprocess;
-    let sample_rate = app.sample_rate as u32;
-    let frame_size = app.frame_size as usize;
-    let mut buf: Vec<f32> = Vec::new();
-    while let Some(pcm) = audio_rx.recv().await {
-        if post.enabled {
-            buf.extend_from_slice(&pcm);
+    // Long texts are split into sentence-aligned chunks of at most
+    // `max_tokens_per_chunk` tokens; each chunk is synthesized as its own
+    // utterance so long paragraphs don't devolve into stuttering noise.
+    let mut texts: Vec<String> = Vec::new();
+    {
+        let (prepared, _) = ptts::tts_model::prepare_text_prompt(text);
+        let n_tokens = app.model.flow_lm.conditioner.tokenize(&prepared)?.len();
+        if app.max_tokens_per_chunk > 0 && n_tokens > app.max_tokens_per_chunk {
+            match app.model.flow_lm.conditioner.tokenizer.as_deref() {
+                Some(tok) => {
+                    texts = ptts::tts_model::split_into_best_sentences(
+                        tok,
+                        text,
+                        Some(app.max_tokens_per_chunk),
+                    )?;
+                }
+                None => texts.push(text.to_string()),
+            }
         } else {
+            texts.push(text.to_string());
+        }
+    }
+
+    for chunk in texts {
+        let (prepared, frames_after_eos) = ptts::tts_model::prepare_text_prompt(&chunk);
+        let tokens = app.model.flow_lm.conditioner.tokenize(&prepared)?;
+        let state = base_state.clone();
+        let model = Arc::clone(&app.model);
+        let temperature = app.temperature;
+        let seed = app.seed_base ^ (stream_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
+
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+        let join = tokio::task::spawn_blocking(move || {
+            generate_chunks(model, state, tokens, temperature, seed, frames_after_eos, audio_tx)
+        });
+
+        while let Some(pcm) = audio_rx.recv().await {
             let encoded = encoder.encode(&pcm)?;
             let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
             if reply_tx
@@ -327,31 +341,9 @@ async fn generate_one<Q: xn::BackendQ>(
                 break;
             }
         }
+        drop(audio_rx);
+        join.await??;
     }
-    if post.enabled {
-        let t0 = std::time::Instant::now();
-        let mut pp = ptts::postprocess::PostProcess::from_config(&post);
-        pp.process(&mut buf, sample_rate)?;
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        tracing::info!(stream_id, audio_s = buf.len() as f64 / sample_rate as f64, ms, "postprocess");
-        for pcm in buf.chunks(frame_size) {
-            let encoded = encoder.encode(pcm)?;
-            let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
-            if reply_tx
-                .send(TtsReply::Audio {
-                    audio,
-                    start_s: encoded.start_s,
-                    stop_s: encoded.stop_s,
-                    stream_id,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    }
-    drop(audio_rx);
-    join.await??;
     Ok(())
 }
 

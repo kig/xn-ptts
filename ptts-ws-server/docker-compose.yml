@@ -26,7 +26,8 @@ services:
       - /models/config.json
       - --quant
       - q8_0            # or q4k for ~12% more throughput at high concurrency
-      - --postprocess   # denoise + loudness normalize (-18 LUFS) + limiter
+      - --default-voice
+      - jane            # fallback for unknown/omitted voices
     ports:
       - "8000:8000"
     volumes:

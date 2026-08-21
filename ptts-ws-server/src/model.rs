@@ -158,7 +158,7 @@ pub struct AppStateB<Q: BackendQ> {
     pub seed_base: u64,
     pub sample_rate: u32,
     pub frame_size: u32,
-    pub postprocess: ptts::postprocess::PostProcessConfig,
+    pub max_tokens_per_chunk: usize,
 }
 
 #[derive(Clone)]
@@ -326,8 +326,8 @@ pub fn load_ptts<Q: BackendQ>(
     temperature: f32,
     seed_base: u64,
     max_seq_len: usize,
-    postprocess: ptts::postprocess::PostProcessConfig,
     default_voice: Option<String>,
+    max_tokens_per_chunk: usize,
     dev: Q::B,
 ) -> Result<AppStateB<Q>> {
     let mut m = match config {
@@ -393,7 +393,7 @@ pub fn load_ptts<Q: BackendQ>(
         seed_base,
         sample_rate,
         frame_size,
-        postprocess,
+        max_tokens_per_chunk,
     })
 }
 

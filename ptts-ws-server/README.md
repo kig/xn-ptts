@@ -38,10 +38,13 @@ knobs (compose `command` or `docker run` args): `--quant q8_0` (or `q4k` for
 ≈12% more throughput at high concurrency, or `f32` for parity with the old
 image). Recommended cpuset: `--cpuset-cpus=0-15` (physical cores only).
 
-Output post-processing: `--postprocess` enables per-utterance spectral
-denoising + loudness normalization (`--target-lufs`, default -18) + soft
-limiter. Measured: exact -18 LUFS across voices, ~10-17 ms CPU per utterance,
-zero glitches/clipping (see `experiments/notebook.md`).
+Output handling: raw decoder output (no post-processing — loudness
+normalization and denoising were removed after they proved to overboost and
+clip). Long texts are split into sentence-aligned chunks of at most
+`--max-tokens-per-chunk` tokens (default 150; mirrors pip pocket-tts
+chunking — without it, long paragraphs degrade into stuttering noise:
+measured 146s of -40dB-noise audio vs 79s clean on the same 433-token text).
+`--default-voice` sets the fallback for unknown/omitted voices.
 
 Voices: both classic `audio_prompt`-style embeddings and pip pocket-tts
 **precomputed-state** voices are supported (`transformer.layers.N.self_attn/

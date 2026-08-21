@@ -56,23 +56,16 @@ struct Args {
     #[arg(long)]
     quant: Option<String>,
 
-    /// Enable output post-processing: spectral denoising + loudness
-    /// normalization (--target-lufs) + soft limiter. Applied per utterance.
-    #[arg(long, default_value_t = false)]
-    postprocess: bool,
-
-    /// Integrated-loudness target for --postprocess, in LUFS.
-    #[arg(long, default_value_t = -18.0)]
-    target_lufs: f64,
-
-    /// Maximum gain applied by loudness normalization, in dB.
-    #[arg(long, default_value_t = 24.0)]
-    max_gain_db: f64,
-
     /// Voice used when a client omits the voice or requests an unknown one.
     /// Defaults to the alphabetically-first registered voice.
     #[arg(long)]
     default_voice: Option<String>,
+
+    /// Long texts are split into sentence-aligned chunks of at most this many
+    /// tokens before synthesis (mirrors the pip pocket-tts chunking, which
+    /// avoids long-sequence stutter). 0 disables chunking.
+    #[arg(long, default_value_t = 150)]
+    max_tokens_per_chunk: usize,
 }
 
 fn init_tracing() {
@@ -107,11 +100,6 @@ async fn main() -> Result<()> {
 }
 
 fn build_app_state(args: &Args) -> Result<model::AppState> {
-    let _pp = ptts::postprocess::PostProcessConfig {
-        enabled: args.postprocess,
-        target_lufs: args.target_lufs,
-        max_gain_db: args.max_gain_db,
-    };
     let _default_voice = args.default_voice.clone();
     if args.cuda as u8 + args.vulkan as u8 + args.metal as u8 > 1 {
         anyhow::bail!("at most one of --cuda, --vulkan, and --metal can be used");
@@ -132,8 +120,8 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
                 args.temperature,
                 args.seed,
                 args.max_seq_len,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 dev,
             )?;
             return Ok(model::AppState::Cuda(Arc::new(s)));
@@ -151,8 +139,8 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
                 args.temperature,
                 args.seed,
                 args.max_seq_len,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 dev,
             )?;
             return Ok(model::AppState::Vulkan(Arc::new(s)));
@@ -170,8 +158,8 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
                 args.temperature,
                 args.seed,
                 args.max_seq_len,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 dev,
             )?;
             return Ok(model::AppState::Metal(Arc::new(s)));
@@ -189,11 +177,6 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
     let mlen = args.max_seq_len;
     let config = args.config.as_ref();
     let voice_dir = args.voice_dir.as_ref();
-    let pp = ptts::postprocess::PostProcessConfig {
-        enabled: args.postprocess,
-        target_lufs: args.target_lufs,
-        max_gain_db: args.max_gain_db,
-    };
     let default_voice = args.default_voice.clone();
     let state = match args.quant.as_deref() {
         None => {
@@ -204,8 +187,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -217,8 +200,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -230,8 +213,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -243,8 +226,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -256,8 +239,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -269,8 +252,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -282,8 +265,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -295,8 +278,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -308,8 +291,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -321,8 +304,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }
@@ -334,8 +317,8 @@ fn build_cpu_state(args: &Args) -> Result<model::AppState> {
                 temp,
                 seed,
                 mlen,
-                pp,
                 default_voice.clone(),
+                args.max_tokens_per_chunk,
                 xn::CPU,
             )?))
         }

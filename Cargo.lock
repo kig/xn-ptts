@@ -2231,7 +2231,6 @@ dependencies = [
  "libc",
  "rand",
  "rand_distr",
- "realfft",
  "rubato",
  "safetensors",
  "sentencepiece",

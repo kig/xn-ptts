@@ -10,7 +10,6 @@ pub mod rope;
 pub mod seanet;
 pub mod transformer;
 pub mod tts_model;
-pub mod postprocess;
 pub mod utils;
 pub mod wav;
 

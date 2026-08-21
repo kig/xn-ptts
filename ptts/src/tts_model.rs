@@ -458,12 +458,53 @@ pub fn split_into_best_sentences(
         sentences.push((end - start, text));
     }
 
+    // Sub-split oversized sentences on commas, semicolons and colons (mirrors
+    // the Python implementation) so a single long sentence still chunks.
+    let fallback_marker_tokens = tokenizer.encode(",;:")?;
+    let fallback_tokens = if fallback_marker_tokens.len() > 1 {
+        &fallback_marker_tokens[1..]
+    } else {
+        &fallback_marker_tokens[..]
+    };
+    let mut refined: Vec<(usize, String)> = Vec::new();
+    for (nb_tokens, sentence) in sentences {
+        if nb_tokens <= max_tokens {
+            refined.push((nb_tokens, sentence));
+            continue;
+        }
+        let sub_tokens = tokenizer.encode(&sentence)?;
+        let mut sub_boundaries = vec![0usize];
+        let mut prev_was_eos = false;
+        for (idx, &token) in sub_tokens.iter().enumerate() {
+            if fallback_tokens.contains(&token) {
+                prev_was_eos = true;
+            } else {
+                if prev_was_eos {
+                    sub_boundaries.push(idx);
+                }
+                prev_was_eos = false;
+            }
+        }
+        sub_boundaries.push(sub_tokens.len());
+        let mut sub_segments: Vec<(usize, String)> = Vec::new();
+        for window in sub_boundaries.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            let text = tokenizer.decode(&sub_tokens[start..end])?;
+            sub_segments.push((end - start, text));
+        }
+        if sub_segments.len() > 1 {
+            refined.extend(sub_segments);
+        } else {
+            refined.push((nb_tokens, sentence));
+        }
+    }
+
     // Greedily group sentences into chunks that stay under max_tokens.
     let mut chunks = Vec::new();
     let mut current_chunk = String::new();
     let mut current_token_count = 0;
 
-    for (nb_tokens, sentence) in sentences {
+    for (nb_tokens, sentence) in refined {
         if current_chunk.is_empty() {
             current_chunk = sentence;
             current_token_count = nb_tokens;
