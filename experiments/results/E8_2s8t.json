@@ -1,0 +1,95 @@
+{
+  "meta": {
+    "name": "E8_2s8t",
+    "quant": "q8_0",
+    "workers": "a:0,1,2,3,4,5,6,7:8|b:8,9,10,11,12,13,14,15:8",
+    "share_model": false,
+    "utts_per_worker": 2,
+    "target_chars": 600,
+    "seed": 42,
+    "date": "2026-08-20 13:32:07"
+  },
+  "workers": [
+    {
+      "speaker": "a",
+      "label": "a",
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "threads": 8,
+      "rows": [
+        {
+          "wall_s": 21.508007515221834,
+          "audio_s": 27.68,
+          "rtf": 0.7770233928909622,
+          "samples": 664320,
+          "rms": 0.12273641443191852,
+          "nan": false,
+          "text_chars": 588
+        },
+        {
+          "wall_s": 21.079470559954643,
+          "audio_s": 27.36,
+          "rtf": 0.7704484853784592,
+          "samples": 656640,
+          "rms": 0.12466569106064639,
+          "nan": false,
+          "text_chars": 574
+        }
+      ],
+      "warmup_rtf": 0.6177223938720999
+    },
+    {
+      "speaker": "b",
+      "label": "b",
+      "cpus": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "threads": 8,
+      "rows": [
+        {
+          "wall_s": 21.129499100148678,
+          "audio_s": 27.12,
+          "rtf": 0.7791113237517949,
+          "samples": 650880,
+          "rms": 0.10977024481616912,
+          "nan": false,
+          "text_chars": 553
+        },
+        {
+          "wall_s": 23.29524115473032,
+          "audio_s": 29.2,
+          "rtf": 0.7977822313263808,
+          "samples": 700800,
+          "rms": 0.13301027701048954,
+          "nan": false,
+          "text_chars": 617
+        }
+      ],
+      "warmup_rtf": 0.61277823584262
+    }
+  ],
+  "global": {
+    "wall_s": 52.06313384510577,
+    "gen_wall_s": 44.424740254879,
+    "total_audio_s": 111.36,
+    "throughput": 2.138941546071923,
+    "gen_throughput": 2.5067113360954263,
+    "effective_rtf": 0.4675209576607917,
+    "n_utterances": 4
+  }
+}

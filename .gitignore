@@ -25,3 +25,6 @@ tmp/
 *.wav
 .DS_Store
 .claude
+experiments/wavs/
+experiments/wavs2/
+experiments/gather.log

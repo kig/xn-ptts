@@ -108,15 +108,57 @@ fn load_voice_embedding<B: xn::Backend>(
     }
 }
 
+/// A registered voice: either a classic audio-prompt embedding
+/// (`audio_prompt`/`emb` [1, T, d_model]) or a precomputed flow-LM state
+/// (pip pocket-tts style: `transformer.layers.N.self_attn/cache`
+/// [2, b, seq, h, d] + `offset`, k/v split on dim 0).
+pub enum VoiceAsset<Q: BackendQ> {
+    Embedding(Tensor<Q::T, Q::B>),
+    State(Vec<Option<(Tensor<f32, Q::B>, Tensor<f32, Q::B>)>>, usize),
+}
+
+fn load_voice_asset<Q: BackendQ>(
+    voice_path: &std::path::Path,
+    dev: &Q::B,
+) -> Result<VoiceAsset<Q>> {
+    let vb = VB::load(&[voice_path], dev.clone())?;
+    let names = vb.tensor_names();
+    if names.iter().any(|n| n.contains("self_attn/cache")) {
+        let mut layers = Vec::new();
+        let mut end = 0usize;
+        for i in 0..8 {
+            let kname = format!("transformer.layers.{i}.self_attn/cache");
+            if !names.iter().any(|n| n == &kname) {
+                break;
+            }
+            let shape = vb.shape(&kname).context("voice state cache shape")?;
+            let cache: Tensor<f32, Q::B> = vb.tensor(&kname, shape)?;
+            let (b, seq, h, d) = (cache.dim(1)?, cache.dim(2)?, cache.dim(3)?, cache.dim(4)?);
+            let k = cache.narrow(0, 0..1)?.reshape((b, seq, h, d))?.contiguous()?;
+            let v = cache.narrow(0, 1..2)?.reshape((b, seq, h, d))?.contiguous()?;
+            layers.push(Some((k, v)));
+            end = seq; // offset tensors are I64; the cache length is authoritative
+        }
+        if layers.is_empty() {
+            anyhow::bail!("voice state file has no cache tensors");
+        }
+        Ok(VoiceAsset::State(layers, end))
+    } else {
+        let emb = load_voice_embedding(voice_path, dev)?;
+        Ok(VoiceAsset::Embedding(emb.to::<Q::T>()?))
+    }
+}
+
 pub struct AppStateB<Q: BackendQ> {
     pub model: Arc<TTSModel<Q>>,
-    pub voices: HashMap<String, Tensor<Q::T, Q::B>>,
+    pub voices: HashMap<String, VoiceAsset<Q>>,
     pub default_voice: String,
     pub max_seq_len: usize,
     pub temperature: f32,
     pub seed_base: u64,
     pub sample_rate: u32,
     pub frame_size: u32,
+    pub postprocess: ptts::postprocess::PostProcessConfig,
 }
 
 #[derive(Clone)]
@@ -142,7 +184,7 @@ pub enum AppState {
 
 struct LoadedModel<Q: BackendQ> {
     cfg: TTSConfig,
-    voices: HashMap<String, Tensor<Q::T, Q::B>>,
+    voices: HashMap<String, VoiceAsset<Q>>,
     tokenizer_path: std::path::PathBuf,
     model_path: std::path::PathBuf,
 }
@@ -160,11 +202,9 @@ impl<Q: BackendQ> LoadedModel<Q> {
         tracing::info!(?model_path, "model weights ready");
         let tokenizer_path = repo.get("tokenizer.model")?;
 
-        let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
-        let default_voice = load_voice_embedding(&repo.get("default-voice.safetensors")?, dev)
-            .with_context(|| "failed to load default voice embedding")?
-            .to::<Q::T>()
-            .with_context(|| "failed to convert default voice embedding")?;
+        let mut voices: HashMap<String, VoiceAsset<Q>> = HashMap::new();
+        let default_voice = load_voice_asset::<Q>(&repo.get("default-voice.safetensors")?, dev)
+            .with_context(|| "failed to load default voice embedding")?;
         voices.insert("default".to_string(), default_voice);
         tracing::info!(num_voices = voices.len(), "voice embeddings loaded");
 
@@ -178,19 +218,14 @@ impl<Q: BackendQ> LoadedModel<Q> {
         tracing::info!(?model_path, "model weights ready");
         let tokenizer_path = repo.get("tokenizer.model")?;
 
-        let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
+        let mut voices: HashMap<String, VoiceAsset<Q>> = HashMap::new();
         for &voice in VOICES {
             let voice_file = format!("embeddings/{voice}.safetensors");
             match repo.get(&voice_file) {
-                Ok(voice_path) => match load_voice_embedding(&voice_path, dev) {
-                    Ok(emb) => match emb.to::<Q::T>() {
-                        Ok(emb) => {
-                            voices.insert(voice.to_string(), emb);
-                        }
-                        Err(e) => {
-                            tracing::warn!(?voice, error = %e, "failed to convert voice embedding")
-                        }
-                    },
+                Ok(voice_path) => match load_voice_asset(&voice_path, dev) {
+                    Ok(asset) => {
+                        voices.insert(voice.to_string(), asset);
+                    }
                     Err(e) => tracing::warn!(?voice, error = %e, "failed to load voice embedding"),
                 },
                 Err(e) => tracing::warn!(?voice, error = %e, "failed to download voice embedding"),
@@ -219,7 +254,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
             );
         };
         let tokenizer_path = parent_dir.join("tokenizer.model");
-        let mut voices: HashMap<String, Tensor<Q::T, Q::B>> = HashMap::new();
+        let mut voices: HashMap<String, VoiceAsset<Q>> = HashMap::new();
         for voice in parent_dir.join("voices").read_dir()? {
             let voice = match voice {
                 Ok(v) => v,
@@ -231,15 +266,10 @@ impl<Q: BackendQ> LoadedModel<Q> {
             }
             let voice_name =
                 voice.file_stem().and_then(|s| s.to_str()).context("invalid voice file name")?;
-            match load_voice_embedding(&voice, dev) {
-                Ok(emb) => match emb.to::<Q::T>() {
-                    Ok(emb) => {
-                        voices.insert(voice_name.to_string(), emb);
-                    }
-                    Err(e) => {
-                        tracing::warn!(?voice_name, error = %e, "failed to convert voice embedding")
-                    }
-                },
+            match load_voice_asset::<Q>(&voice, dev) {
+                Ok(asset) => {
+                    voices.insert(voice_name.to_string(), asset);
+                }
                 Err(e) => tracing::warn!(?voice_name, error = %e, "failed to load voice embedding"),
             }
         }
@@ -254,7 +284,7 @@ impl<Q: BackendQ> LoadedModel<Q> {
 fn load_voices_from_dir<Q: BackendQ>(
     dir: &std::path::Path,
     dev: &Q::B,
-    voices: &mut HashMap<String, Tensor<Q::T, Q::B>>,
+    voices: &mut HashMap<String, VoiceAsset<Q>>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -281,15 +311,10 @@ fn load_voices_from_dir<Q: BackendQ>(
                 continue;
             }
         };
-        match load_voice_embedding(&path, dev) {
-            Ok(emb) => match emb.to::<Q::T>() {
-                Ok(emb) => {
-                    voices.insert(voice_name, emb);
-                }
-                Err(e) => {
-                    tracing::warn!(?voice_name, error = %e, "failed to convert voice embedding")
-                }
-            },
+        match load_voice_asset::<Q>(&path, dev) {
+            Ok(asset) => {
+                voices.insert(voice_name, asset);
+            }
             Err(e) => tracing::warn!(?voice_name, error = %e, "failed to load voice embedding"),
         }
     }
@@ -301,6 +326,8 @@ pub fn load_ptts<Q: BackendQ>(
     temperature: f32,
     seed_base: u64,
     max_seq_len: usize,
+    postprocess: ptts::postprocess::PostProcessConfig,
+    default_voice: Option<String>,
     dev: Q::B,
 ) -> Result<AppStateB<Q>> {
     let mut m = match config {
@@ -344,14 +371,18 @@ pub fn load_ptts<Q: BackendQ>(
             || v.starts_with("mimi.encoder")
             || v.starts_with("mimi.downsample.")
             || v == "flow_lm.speaker_proj_weight"
+            || v == "flow_lm.bos_before_voice"
             || v.starts_with("mimi.quantizer")
     })?;
 
     let sample_rate = model.sample_rate() as u32;
     let frame_size = (sample_rate as f64 / m.cfg.mimi.frame_rate).round() as u32;
-    let default_voice = match m.voices.keys().min() {
-        Some(name) => name.clone(),
-        None => anyhow::bail!("no voice embeddings found in model"),
+    let default_voice = match default_voice.as_deref() {
+        Some(name) if m.voices.contains_key(name) => name.to_string(),
+        _ => match m.voices.keys().min() {
+            Some(name) => name.clone(),
+            None => anyhow::bail!("no voice embeddings found in model"),
+        },
     };
     Ok(AppStateB {
         model: Arc::new(model),
@@ -362,6 +393,7 @@ pub fn load_ptts<Q: BackendQ>(
         seed_base,
         sample_rate,
         frame_size,
+        postprocess,
     })
 }
 

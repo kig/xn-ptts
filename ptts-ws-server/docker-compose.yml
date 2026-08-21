@@ -1,0 +1,37 @@
+# Optimized Pocket-TTS WebSocket server (drop-in replacement).
+#
+# Replaces a bare deployment of `ptts-ws-server --addr 0.0.0.0:8000
+# --config /models/config.json` (see Dockerfile.xnptts.current):
+#   - same port, same /models mount layout, same ws protocol
+#   - + q8_0 weights (1.4-1.8x over f32), + RAYON_NUM_THREADS=1 (one
+#     single-threaded stream per connection; multi-threaded streams measured
+#     0.74x), + q8 KV cache in ptts core (3.8x less KV memory)
+#   - cpuset 0-15: physical cores only, SMT siblings excluded
+#
+# Usage:
+#   docker compose up -d --build
+# To swap over the live server (as root):
+#   kill $(pgrep -f "ptts-ws-server --addr 0.0.0.0:8000")
+#   docker compose up -d --build
+services:
+  ptts-ws:
+    build:
+      context: ..
+      dockerfile: ptts-ws-server/Dockerfile
+    command:
+      - ptts-ws-server
+      - --addr
+      - 0.0.0.0:8000
+      - --config
+      - /models/config.json
+      - --quant
+      - q8_0            # or q4k for ~12% more throughput at high concurrency
+      - --postprocess   # denoise + loudness normalize (-18 LUFS) + limiter
+    ports:
+      - "8000:8000"
+    volumes:
+      - /models:/models:ro
+    environment:
+      RAYON_NUM_THREADS: "1"   # one thread per generation stream (also in image)
+    cpuset: "0-15"             # physical cores only; no SMT
+    restart: unless-stopped

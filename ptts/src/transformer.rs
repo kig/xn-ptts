@@ -3,22 +3,23 @@ use crate::rope::RotaryEmbedding;
 use xn::nn::{LayerNorm, Linear, var_builder::Path};
 use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
-/// State for StreamingMultiheadAttention.
+/// State for StreamingMultiheadAttention with a q8_0-quantized KV cache.
 #[derive(Debug, Clone)]
 pub struct StreamingMHAState<T: WithDTypeF, B: Backend> {
-    /// Key cache: shape [batch_size, sequence_length, num_heads, dim_per_head]
-    pub k_cache: Tensor<T, B>,
-    /// Value cache: shape [batch_size, sequence_length, num_heads, dim_per_head]
-    pub v_cache: Tensor<T, B>,
+    k_store: Q8KvStore<B>,
+    v_store: Q8KvStore<B>,
     /// Current end position (number of tokens seen so far).
     pub current_end: usize,
+    _marker: std::marker::PhantomData<T>,
 }
 
 impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
     pub fn device(&self) -> &B {
-        self.k_cache.device()
+        self.k_store.device()
     }
 
+    /// Append new k, v (shape [b, t, h, d]) and return full (k, v) as
+    /// contiguous [b, h, seq, d] f32 tensors, dequantized for attention.
     #[allow(clippy::type_complexity)]
     pub fn complete_kv(
         &mut self,
@@ -26,14 +27,17 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
         v: &Tensor<T, B>,
     ) -> Result<(Tensor<T, B>, Tensor<T, B>)> {
         let t = k.dim(1usize)?;
-
-        self.k_cache.slice_set(k, 1usize, self.current_end)?;
-        self.v_cache.slice_set(v, 1usize, self.current_end)?;
-
-        let new_end = self.current_end + t;
-        let keys = self.k_cache.narrow(1, 0..new_end)?.contiguous()?;
-        let values = self.v_cache.narrow(1, 0..new_end)?.contiguous()?;
-        self.current_end = new_end;
+        let (b, _, h, d) = k.dims4()?;
+        debug_assert_eq!(d, self.k_store.d, "KV dim mismatch");
+        debug_assert_eq!(h, self.k_store.heads, "KV heads mismatch");
+        debug_assert_eq!(b, self.k_store.batch, "KV batch mismatch");
+        let kf: Vec<f32> = k.to_vec()?.into_iter().map(|x| x.to_f32()).collect();
+        let vf: Vec<f32> = v.to_vec()?.into_iter().map(|x| x.to_f32()).collect();
+        self.k_store.append(&kf, b, h, t)?;
+        self.v_store.append(&vf, b, h, t)?;
+        self.current_end += t;
+        let keys = self.k_store.materialize::<T>()?;
+        let values = self.v_store.materialize::<T>()?;
         Ok((keys, values))
     }
 
@@ -50,7 +54,164 @@ impl<T: WithDTypeF, B: Backend> StreamingMHAState<T, B> {
                 }
             }
         }
-        Tensor::from_vec(data, (num_queries, num_keys), self.k_cache.device())
+        Tensor::from_vec(data, (num_queries, num_keys), self.k_store.device())
+    }
+
+    /// Import a precomputed KV pair (shape [b, seq, h, d], f32) — used for
+    /// state-style voice files (pip pocket-tts voices are pre-prompted flow_lm
+    /// states). The f32 caches are quantized into the q8 store.
+    pub fn import_kv(
+        &mut self,
+        k: &Tensor<f32, B>,
+        v: &Tensor<f32, B>,
+        end: usize,
+    ) -> Result<()> {
+        let t = k.dim(1usize)?;
+        let (b, _, h, d) = k.dims4()?;
+        debug_assert_eq!(d, self.k_store.d, "KV dim mismatch");
+        debug_assert_eq!(h, self.k_store.heads, "KV heads mismatch");
+        debug_assert_eq!(b, self.k_store.batch, "KV batch mismatch");
+        let kf: Vec<f32> = k.to_vec()?;
+        let vf: Vec<f32> = v.to_vec()?;
+        self.k_store.current_end = 0;
+        self.v_store.current_end = 0;
+        self.k_store.append(&kf, b, h, t)?;
+        self.v_store.append(&vf, b, h, t)?;
+        let end = if end == 0 { t } else { end.min(t) };
+        self.current_end = end;
+        self.k_store.current_end = end;
+        self.v_store.current_end = end;
+        Ok(())
+    }
+}
+
+/// q8_0 block-quantized streaming KV store (one per key/value).
+///
+/// Values are stored as int8 with one f32 scale per 32-element block, which
+/// cuts the KV cache footprint ~3.8x (f32 -> 1.125 bytes/float). The whole
+/// flow-LM hot set (q8 weights ~71MB + quantized KV) then fits the 128MB
+/// aggregate L3 even with several concurrent generation streams, whereas the
+/// f32 KV alone (21MB/stream) exceeded it.
+///
+/// Layout: data[b][h][seq][d] (d padded to a multiple of 32),
+/// scales[b][h][seq][d/32].
+#[derive(Clone, Debug)]
+struct Q8KvStore<B: Backend> {
+    d: usize,
+    blocks_per_row: usize,
+    batch: usize,
+    heads: usize,
+    seq_capacity: usize,
+    data: Vec<i8>,
+    scales: Vec<f32>,
+    current_end: usize,
+    device: B,
+}
+
+impl<B: Backend> Q8KvStore<B> {
+    fn new(batch: usize, heads: usize, seq_capacity: usize, d: usize, device: B) -> Self {
+        let blocks_per_row = d.div_ceil(32);
+        let d_padded = blocks_per_row * 32;
+        let data = vec![0i8; batch * heads * seq_capacity * d_padded];
+        let scales = vec![0f32; batch * heads * seq_capacity * blocks_per_row];
+        Self { d, blocks_per_row, batch, heads, seq_capacity, data, scales, current_end: 0, device }
+    }
+
+    fn device(&self) -> &B {
+        &self.device
+    }
+
+    fn offset(&self, b: usize, h: usize, seq: usize) -> (usize, usize) {
+        let row = (b * self.heads + h) * self.seq_capacity + seq;
+        (row * self.d, row * self.blocks_per_row)
+    }
+
+    /// Quantize new rows [b, t, h, d] into the store at current_end.
+    fn append(&mut self, vals: &[f32], b: usize, h: usize, t: usize) -> Result<()> {
+        if self.current_end + t > self.seq_capacity {
+            xn::bail!(
+                "KV cache overflow: end {} + {t} > capacity {}",
+                self.current_end,
+                self.seq_capacity
+            );
+        }
+        let d = self.d;
+        let row_floats = h * d;
+        let blocks = self.blocks_per_row;
+        for bi in 0..b {
+            for seq in 0..t {
+                let base = (bi * t + seq) * row_floats;
+                for hi in 0..h {
+                    let (data_off, scale_off) = self.offset(bi, hi, self.current_end + seq);
+                    let src = base + hi * d;
+                    let dst = data_off;
+                    let scl = scale_off;
+                    quantize_row_q8_0(
+                        &vals[src..src + d],
+                        &mut self.data[dst..dst + d],
+                        &mut self.scales[scl..scl + blocks],
+                    );
+                }
+            }
+        }
+        self.current_end += t;
+        Ok(())
+    }
+
+    /// Dequantize into a [b, h, seq, d] f32 tensor (contiguous).
+    fn materialize<T: WithDTypeF>(&self) -> Result<Tensor<T, B>> {
+        let end = self.current_end;
+        let mut out = vec![0f32; self.batch * self.heads * end * self.d];
+        for bi in 0..self.batch {
+            for hi in 0..self.heads {
+                for seq in 0..end {
+                    let (data_off, scale_off) = self.offset(bi, hi, seq);
+                    let dst = ((bi * self.heads + hi) * end + seq) * self.d;
+                    dequant_row_q8_0(
+                        &self.data[data_off..data_off + self.d],
+                        &self.scales[scale_off..scale_off + self.blocks_per_row],
+                        &mut out[dst..dst + self.d],
+                    );
+                }
+            }
+        }
+        let mut t_out = Vec::with_capacity(out.len());
+        t_out.extend(out.iter().map(|x| T::from_f32(*x)));
+        Tensor::from_vec(t_out, (self.batch, self.heads, end, self.d), &self.device)
+    }
+}
+
+/// Quantize one row of `d` floats (d % 32 == 0) into q8_0 blocks.
+fn quantize_row_q8_0(src: &[f32], dst: &mut [i8], scales: &mut [f32]) {
+    let blocks = src.len() / 32;
+    debug_assert_eq!(blocks * 32, src.len());
+    for blk in 0..blocks {
+        let s = &src[blk * 32..(blk + 1) * 32];
+        let mut amax = 0.0f32;
+        for x in s {
+            amax = amax.max(x.abs());
+        }
+        let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+        scales[blk] = scale;
+        let inv = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+        let d = &mut dst[blk * 32..(blk + 1) * 32];
+        for (x, q) in s.iter().zip(d.iter_mut()) {
+            *q = (x * inv).round() as i8;
+        }
+    }
+}
+
+/// Dequantize one row of `d` q8_0 values into f32.
+fn dequant_row_q8_0(src: &[i8], scales: &[f32], dst: &mut [f32]) {
+    let blocks = src.len() / 32;
+    debug_assert_eq!(blocks * 32, src.len());
+    for blk in 0..blocks {
+        let scale = scales[blk];
+        let s = &src[blk * 32..(blk + 1) * 32];
+        let d = &mut dst[blk * 32..(blk + 1) * 32];
+        for (q, x) in s.iter().zip(d.iter_mut()) {
+            *x = (*q as f32) * scale;
+        }
     }
 }
 
@@ -84,11 +245,10 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         sequence_length: usize,
     ) -> Result<StreamingMHAState<Q::T, Q::B>> {
         let dim_per_head = self.embed_dim / self.num_heads;
-        let shape = (batch_size, sequence_length, self.num_heads, dim_per_head);
         let dev = &self.device;
-        let k_cache = Tensor::zeros(shape, dev)?;
-        let v_cache = Tensor::zeros(shape, dev)?;
-        Ok(StreamingMHAState { k_cache, v_cache, current_end: 0 })
+        let k_store = Q8KvStore::new(batch_size, self.num_heads, sequence_length, dim_per_head, dev.clone());
+        let v_store = Q8KvStore::new(batch_size, self.num_heads, sequence_length, dim_per_head, dev.clone());
+        Ok(StreamingMHAState { k_store, v_store, current_end: 0, _marker: std::marker::PhantomData })
     }
 
     #[tracing::instrument(name = "attn", skip_all)]
@@ -118,11 +278,10 @@ impl<Q: BackendQ> StreamingMultiheadAttention<Q> {
         // Apply RoPE: q, k are [b, t, h, d]
         let (q, k) = rope.forward(&q, &k)?;
         let (k, v) = state.complete_kv(&k, &v)?;
+        // complete_kv returns k, v as [b, h, seq, d] (contiguous)
 
-        // Transpose to [b, h, t, d] for attention
+        // Transpose query to [b, h, t, d] for attention
         let q = q.transpose(1, 2)?;
-        let k = k.transpose(1, 2)?;
-        let v = v.transpose(1, 2)?;
 
         // Scaled dot-product attention
         let scale = Q::T::from_f32(1.0 / (d as f32).sqrt());
@@ -214,6 +373,23 @@ pub enum LayerAttentionState<T: WithDTypeF, B: Backend> {
 #[derive(Clone, Debug)]
 pub struct StreamingTransformerState<T: WithDTypeF, B: Backend> {
     pub layer_states: Vec<LayerAttentionState<T, B>>,
+}
+
+impl<T: WithDTypeF, B: Backend> StreamingTransformerState<T, B> {
+    /// Import a precomputed KV pair into flow-LM layer `layer` (state-style
+    /// voice files). `end` is the number of prompted tokens.
+    pub fn import_kv(
+        &mut self,
+        layer: usize,
+        k: &Tensor<f32, B>,
+        v: &Tensor<f32, B>,
+        end: usize,
+    ) -> Result<()> {
+        match self.layer_states.get_mut(layer) {
+            Some(LayerAttentionState::FlowLm(mha)) => mha.import_kv(k, v, end),
+            _ => xn::bail!("layer {layer} is not a flow-LM attention layer"),
+        }
+    }
 }
 
 // ---- MimiStreamingMultiheadAttention ----

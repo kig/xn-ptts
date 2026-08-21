@@ -208,26 +208,48 @@ async fn handle_setup<Q: xn::BackendQ>(
         .unwrap_or(&app.default_voice);
     let voice_name =
         if voice_name == "default" { &app.default_voice } else { voice_name }.to_string();
-    let voice_emb_t = match app.voices.get(&voice_name) {
+    let asset = match app.voices.get(&voice_name) {
         Some(v) => v,
         None => {
             send_error(reply_tx, error_codes::NOT_FOUND, format!("unknown voice '{voice_name}'"))?;
             return Ok(None);
         }
     };
-    let mut base_state = match app.model.init_flow_lm_state(1, app.max_seq_len) {
-        Ok(s) => s,
-        Err(e) => {
-            send_error(reply_tx, error_codes::INTERNAL, format!("init_flow_lm_state failed: {e}"))?;
-            return Ok(None);
+    let base_state = match asset {
+        crate::model::VoiceAsset::Embedding(emb) => {
+            let mut st = match app.model.init_flow_lm_state(1, app.max_seq_len) {
+                Ok(s) => s,
+                Err(e) => {
+                    send_error(
+                        reply_tx,
+                        error_codes::INTERNAL,
+                        format!("init_flow_lm_state failed: {e}"),
+                    )?;
+                    return Ok(None);
+                }
+            };
+            tracing::info!(?voice_name, "starting new TTS session");
+            if let Err(e) = app.model.prompt_audio(&mut st, emb) {
+                send_error(reply_tx, error_codes::INTERNAL, format!("prompt_audio failed: {e}"))?;
+                return Ok(None);
+            }
+            st
+        }
+        crate::model::VoiceAsset::State(layers, end) => {
+            tracing::info!(?voice_name, ?end, "starting new TTS session (precomputed state)");
+            match app.model.init_flow_lm_state_from_kv(layers, *end, app.max_seq_len) {
+                Ok(s) => s,
+                Err(e) => {
+                    send_error(
+                        reply_tx,
+                        error_codes::INTERNAL,
+                        format!("init_flow_lm_state_from_kv failed: {e}"),
+                    )?;
+                    return Ok(None);
+                }
+            }
         }
     };
-    tracing::info!(?voice_name, "starting new TTS session");
-    if let Err(e) = app.model.prompt_audio(&mut base_state, voice_emb_t) {
-        send_error(reply_tx, error_codes::INTERNAL, format!("prompt_audio failed: {e}"))?;
-        return Ok(None);
-    }
-    tracing::info!(?voice_name, "prompted voice embedding");
     let request_id = uuid::Uuid::new_v4().to_string();
     let model_name =
         if model_name.is_empty() { "kyutai/pocket-tts".to_string() } else { model_name };
@@ -280,19 +302,52 @@ async fn generate_one<Q: xn::BackendQ>(
         generate_chunks(model, state, tokens, temperature, seed, frames_after_eos, audio_tx)
     });
 
+    // With post-processing enabled, buffer the whole utterance, process it
+    // (denoise -> normalize -> limit), then emit; otherwise stream chunks as
+    // they are decoded.
+    let post = app.postprocess;
+    let sample_rate = app.sample_rate as u32;
+    let frame_size = app.frame_size as usize;
+    let mut buf: Vec<f32> = Vec::new();
     while let Some(pcm) = audio_rx.recv().await {
-        let encoded = encoder.encode(&pcm)?;
-        let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
-        if reply_tx
-            .send(TtsReply::Audio {
-                audio,
-                start_s: encoded.start_s,
-                stop_s: encoded.stop_s,
-                stream_id,
-            })
-            .is_err()
-        {
-            break;
+        if post.enabled {
+            buf.extend_from_slice(&pcm);
+        } else {
+            let encoded = encoder.encode(&pcm)?;
+            let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
+            if reply_tx
+                .send(TtsReply::Audio {
+                    audio,
+                    start_s: encoded.start_s,
+                    stop_s: encoded.stop_s,
+                    stream_id,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    if post.enabled {
+        let t0 = std::time::Instant::now();
+        let mut pp = ptts::postprocess::PostProcess::from_config(&post);
+        pp.process(&mut buf, sample_rate)?;
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(stream_id, audio_s = buf.len() as f64 / sample_rate as f64, ms, "postprocess");
+        for pcm in buf.chunks(frame_size) {
+            let encoded = encoder.encode(pcm)?;
+            let audio = base64::engine::general_purpose::STANDARD.encode(&encoded.data);
+            if reply_tx
+                .send(TtsReply::Audio {
+                    audio,
+                    start_s: encoded.start_s,
+                    stop_s: encoded.stop_s,
+                    stream_id,
+                })
+                .is_err()
+            {
+                break;
+            }
         }
     }
     drop(audio_rx);

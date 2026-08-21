@@ -1,0 +1,20 @@
+# Rust pocket-tts server (xn-ptts) — replaces the python FastAPI server.
+# Same underlying model family (kyutai pocket-tts), pure Rust inference
+# via the `xn` tensor crate; no uvicorn threadpool to deadlock under
+# concurrent requests.
+FROM rust:1-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake pkg-config libclang-dev protobuf-compiler ca-certificates git \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/LaurentMazare/xn-ptts.git .
+# xn pins target-cpu=native via .cargo/config.toml; keep for host build.
+RUN cargo build --release -p ptts-ws-server
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/ptts-ws-server /usr/local/bin/ptts-ws-server
+EXPOSE 8000
+CMD ["ptts-ws-server", "--addr", "0.0.0.0:8000"]

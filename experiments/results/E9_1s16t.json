@@ -1,0 +1,67 @@
+{
+  "meta": {
+    "name": "E9_1s16t",
+    "quant": "q8_0",
+    "workers": "a:0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15:16",
+    "share_model": false,
+    "utts_per_worker": 2,
+    "target_chars": 600,
+    "seed": 42,
+    "date": "2026-08-20 13:33:35"
+  },
+  "workers": [
+    {
+      "speaker": "a",
+      "label": "a",
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "threads": 16,
+      "rows": [
+        {
+          "wall_s": 37.605181554332376,
+          "audio_s": 27.68,
+          "rtf": 1.3585686977721234,
+          "samples": 664320,
+          "rms": 0.12273641443191852,
+          "nan": false,
+          "text_chars": 588
+        },
+        {
+          "wall_s": 36.8015916030854,
+          "audio_s": 27.36,
+          "rtf": 1.3450874123934722,
+          "samples": 656640,
+          "rms": 0.12466569106064639,
+          "nan": false,
+          "text_chars": 574
+        }
+      ],
+      "warmup_rtf": 1.108271730299748
+    }
+  ],
+  "global": {
+    "wall_s": 88.10004507191479,
+    "gen_wall_s": 74.40677315741777,
+    "total_audio_s": 55.04,
+    "throughput": 0.6247442887806884,
+    "gen_throughput": 0.7397176045190845,
+    "effective_rtf": 1.6006548886612426,
+    "n_utterances": 2
+  }
+}

@@ -1,0 +1,7 @@
+target
+experiments
+.git
+.github
+*.wav
+wavs
+wavs2

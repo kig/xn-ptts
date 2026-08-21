@@ -33,6 +33,15 @@ pub struct MimiConfig {
     pub transformer_dim_feedforward: usize,
     #[serde(default)]
     pub downsample_channel_wise: bool,
+    /// Inner (latent) dimension of the mimi encoder: the downsample conv maps
+    /// `dimension` -> `inner_dim` before the quantizer. 512 for the
+    /// 2026-01 codec, 32 for the 2026-04 codec.
+    #[serde(default = "default_inner_dim")]
+    pub inner_dim: usize,
+}
+
+fn default_inner_dim() -> usize {
+    512
 }
 
 pub struct MimiEncoder<Q: BackendQ> {
@@ -119,6 +128,7 @@ impl<Q: BackendQ> MimiEncoder<Q> {
                 &vb.pp("downsample"),
                 downsample_stride,
                 cfg.dimension,
+                cfg.inner_dim,
                 cfg.downsample_channel_wise,
             )?;
             Some(ds)

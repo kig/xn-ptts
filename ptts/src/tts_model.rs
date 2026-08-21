@@ -74,6 +74,10 @@ pub struct TTSConfig {
     /// real audio prompt's length, which preserves the historical behavior.
     #[serde(default)]
     pub cfg_null_audio_empty: bool,
+    /// If true, a learned `flow_lm.bos_before_voice` embedding is prepended to
+    /// the audio prompt in `prompt_audio` (2026-04 models).
+    #[serde(default)]
+    pub insert_bos_before_voice: bool,
 }
 
 impl TTSConfig {
@@ -114,6 +118,7 @@ impl TTSConfig {
                 transformer_max_period: 10000.0,
                 transformer_dim_feedforward: 2048,
                 downsample_channel_wise: false,
+                inner_dim: 512,
             },
             temp,
             lsd_decode_steps: 1,
@@ -129,6 +134,7 @@ impl TTSConfig {
             audio_prompt_min_duration: 10.0,
             audio_prompt_max_duration: 10.0,
             cfg_null_audio_empty: false,
+            insert_bos_before_voice: false,
         }
     }
 
@@ -140,6 +146,7 @@ impl TTSConfig {
 pub struct TTSModel<Q: BackendQ> {
     pub flow_lm: FlowLM<Q>,
     pub mimi: MimiDecoder<Unquantized<f32, Q::B>>,
+    bos_before_voice: Option<Tensor<Q::T, Q::B>>,
     lsd_decode_steps: usize,
     eos_threshold: f32,
 }
@@ -157,10 +164,18 @@ impl<Q: BackendQ> TTSModel<Q> {
     ) -> Result<Self> {
         let flow_lm = FlowLM::load(&vb.pp("flow_lm"), tokenizer, &cfg.flow_lm)?;
         let mimi = MimiDecoder::load(&vb.pp("mimi"), &cfg.mimi)?;
+        let bos_before_voice = if cfg.insert_bos_before_voice
+            && vb.contains("flow_lm.bos_before_voice")
+        {
+            Some(vb.tensor("flow_lm.bos_before_voice", (1, 1, flow_lm.dim))?)
+        } else {
+            None
+        };
 
         Ok(Self {
             flow_lm,
             mimi,
+            bos_before_voice,
             lsd_decode_steps: cfg.lsd_decode_steps,
             eos_threshold: cfg.eos_threshold,
         })
@@ -182,6 +197,28 @@ impl<Q: BackendQ> TTSModel<Q> {
         sequence_length: usize,
     ) -> Result<TTSState<Q>> {
         Ok(TTSState { flow_lm_state: self.flow_lm.init_state(batch_size, sequence_length)? })
+    }
+
+    /// Initialize a flow LM state from precomputed per-layer KV caches
+    /// (state-style voice files from pip pocket-tts: `transformer.layers.N.
+    /// self_attn/cache` [2, b, seq, h, d] with the k/v split on dim 0, plus an
+    /// `offset` scalar = prompted token count). `kv_layers` is per layer.
+    pub fn init_flow_lm_state_from_kv(
+        &self,
+        kv_layers: &[Option<(Tensor<f32, Q::B>, Tensor<f32, Q::B>)>],
+        end: usize,
+        sequence_length: usize,
+    ) -> Result<TTSState<Q>> {
+        let mut state = self.init_flow_lm_state(1, sequence_length)?;
+        for (i, layer) in kv_layers.iter().enumerate() {
+            if let Some((k, v)) = layer {
+                state
+                    .flow_lm_state
+                    .transformer_state
+                    .import_kv(i, k, v, end)?;
+            }
+        }
+        Ok(state)
     }
 
     /// Run flow LM step with text tokens. Increments state.
@@ -238,7 +275,10 @@ impl<Q: BackendQ> TTSModel<Q> {
         let dev = audio_conditioning.device();
         let empty_text = Tensor::zeros((1, 0, self.flow_lm.conditioner.dim), dev)?;
         let empty_latents = Tensor::zeros((1, 0, self.flow_lm.ldim), dev)?;
-        let text_embeddings = Tensor::cat(&[&empty_text, audio_conditioning], 1)?;
+        let text_embeddings = match &self.bos_before_voice {
+            Some(bos) => Tensor::cat(&[&empty_text, bos, audio_conditioning], 1)?,
+            None => Tensor::cat(&[&empty_text, audio_conditioning], 1)?,
+        };
         self.run_backbone_and_increment(state, &text_embeddings, &empty_latents)?;
         Ok(())
     }
@@ -346,8 +386,10 @@ impl<Q: BackendQ> MimiEnc<Q> {
     pub fn load(vb: &Path<Q::B>, cfg: &TTSConfig) -> Result<Self> {
         let mimi = MimiEncoder::load(&vb.pp("mimi"), &cfg.mimi)?;
         let speaker_proj = if vb.contains("flow_lm.speaker_proj_weight") {
-            let weights = vb
-                .tensor("flow_lm.speaker_proj_weight", (cfg.flow_lm.d_model, cfg.mimi.dimension))?;
+            let weights = vb.tensor(
+                "flow_lm.speaker_proj_weight",
+                (cfg.flow_lm.d_model, cfg.mimi.inner_dim),
+            )?;
             Some(Linear::new(weights))
         } else {
             None
