@@ -25,8 +25,11 @@ COPY ptts-ws-server ptts-ws-server/
 RUN cargo build --release -p ptts-ws-server
 
 FROM debian:trixie-slim
+# curl: the deploy entrypoint (scripts/fetch-tts-models.sh in the paperradio
+# repo) downloads the gated model artifacts into /models before exec'ing the
+# server; the slim base has no HTTP client at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgomp1 ca-certificates \
+    libgomp1 ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ptts-ws-server /usr/local/bin/ptts-ws-server
 ENV RAYON_NUM_THREADS=1
