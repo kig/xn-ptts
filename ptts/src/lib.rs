@@ -2,6 +2,7 @@ pub mod conditioners;
 pub mod conv;
 pub mod dummy_quantizer;
 pub mod flow_lm;
+pub mod hf_burst;
 pub mod layer_scale;
 pub mod mimi;
 pub mod mlp;

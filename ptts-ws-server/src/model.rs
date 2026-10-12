@@ -425,15 +425,36 @@ pub fn generate_chunks<Q: BackendQ>(
 
     let decode_model = Arc::clone(&model);
     let decode_audio_tx = audio_tx.clone();
+    let decode_sample_rate = model.sample_rate() as u32;
     let decode_handle = std::thread::spawn(move || -> Result<(), xn::Error> {
+        // The decoder emits 6-11 kHz noise bursts (fricatives/onsets, 20-150 ms,
+        // -19..-32 dBFS); the server's output stage ducks that band in the
+        // frames that carry them so they do not reach the client. See
+        // `ptts::hf_burst`.
+        let mut burst_filter = ptts::hf_burst::HfBurstSuppressor::new(decode_sample_rate);
+        let mut filtered = Vec::new();
         while let Ok(latent) = latent_rx.recv() {
             let audio_chunk = decode_model.decode_latent(&latent, &mut mimi_state)?;
             let pcm = audio_chunk.narrow(0, ..1)?.contiguous()?.to_vec()?;
-            if decode_audio_tx.send(pcm).is_err() {
+            filtered.clear();
+            burst_filter.process(&pcm, &mut filtered);
+            if !filtered.is_empty() && decode_audio_tx.send(filtered.clone()).is_err() {
                 // Client gone — stop draining.
                 break;
             }
         }
+        filtered.clear();
+        burst_filter.flush(&mut filtered);
+        if !filtered.is_empty() {
+            let _ = decode_audio_tx.send(filtered.clone());
+        }
+        let stats = burst_filter.stats();
+        tracing::info!(
+            frames = stats.frames,
+            burst_frames = stats.burst_frames,
+            ducked_frames = stats.ducked_frames,
+            "hf burst filter"
+        );
         Ok(())
     });
 

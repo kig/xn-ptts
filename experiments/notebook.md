@@ -251,3 +251,88 @@ Best strategy on this EPYC 7302 for the 4-voice / 16-min workload:
 Deliverable: 16 min of audio generated in **~56s of compute (17.2× realtime)** with
 utterance order per speaker preserved (a1..a8, b1..b8, ... interleaved at assembly time).
 
+
+## HF burst suppression (2026-10-12) [Rust change: `ptts::hf_burst`]
+Trigger: paperradio listener audit of episode 37155005 (paper 2610.11130) —
+"narrow-band tonal bursts, ~6-11 kHz, 20-150 ms, at -19.6..-32 dBFS, 2.5-6x the
+300-4000 Hz speech band, 86-88 per episode, worst at 6.400 s". Owner's call:
+filter at the TTS output stage, not chase the source.
+
+### Characterisation (measured)
+Harness: `experiments/burstcheck.py` synthesises the 56 lines of that episode's
+`lines.json` through the deployed config (q8_0, `--max-tokens-per-chunk 100`,
+voice jane; 758.3 s of audio) and measures, per 20 ms frame, the 6-11 kHz band
+against the 300-4000 Hz band. Burst event = 6-11 kHz level in [-32,-19.6] dBFS
+and 2.5-6x the speech band, >= 20 ms, merged at 0.3 s.
+
+| measurement (56 lines) | value |
+|---|---|
+| burst events (paperradio's window) | **77** (episode: 86-88; it also contains the ident/intro) |
+| 6-11 kHz, speech-active frames | p95 -28.2, max -19.6 dBFS |
+| 6-11 kHz 8+ dB over the speech band | 6.4% of frames |
+| 300-4000 Hz, speech-active frames | mean -30.2 dBFS |
+
+Where they are: the bursts are the decoder's rendering of fricatives/stops and
+of the transition into speech — e.g. at the episode's worst point (6.400 s =
+onset of line 2, "Today's paper: ...") the raw TTS has a 40 ms burst at line
+time 0.28 s: 6-11 kHz -22.6 dBFS vs speech band -44.5 dBFS, all of it above
+5 kHz. A fricative-free text ("Bob did a good job today. Mama made a lemonade.")
+has no frame above -36 dBFS in that band.
+
+What it is not:
+- **not q8_0**: f32 and q8_0 give the same numbers (p95 -21.2 vs -21.3 dBFS on
+  the same text; identical noise floor).
+- **not the port**: pip pocket-tts 2.1.0 (2026-04 english, same text and voice)
+  is statistically identical (p95 -37.6 vs -36.6 dBFS; frames 8 dB over the
+  speech band 22 vs 28). The bursts are inherent to the model family.
+- **not chunking**: they occur in 15-token utterances, once per burst of
+  fricatives, not at chunk joins.
+- **not tonal in the TTS output**: local-median spectral excess (5.5-12.5 kHz)
+  is p50 10.8 dB on raw TTS but 22.2 dB after a 48 kbps mp3 re-encode, and the
+  episode (48 kbps mp3) measures 23.6 dB. The "narrow-band tonal" colour in the
+  episode is paperradio's mp3 encoder; the *energy* bursts are in the TTS.
+- voice-dependent in loudness only: on the same 13 s text, jane 39 burst
+  frames / max -20.7 dBFS, anna 28 / -26.0, george 9 / -26.7.
+
+### Fix
+`ptts::hf_burst::HfBurstSuppressor` (ptts/src/hf_burst.rs), wired into the
+server's decode path (ptts-ws-server/src/model.rs `generate_chunks`, one
+instance per utterance, streaming, no protocol change). STFT 512 (Hann) / hop
+128 / WOLA; per frame B = 6-11 kHz RMS, S = 300-4000 Hz RMS; if B > -35 dBFS
+and B - S > 8 dB the 5.1-12.2 kHz region is ducked 14 dB (full depth
+5.8-11.5 kHz, 700 Hz raised-cosine edges), with a 4-frame (21 ms) release.
+Nothing below 5.1 kHz is touched.
+
+### Before / after (same 56 lines, same seed — deterministic)
+| metric | before | after |
+|---|---|---|
+| burst events (paperradio window) | 77 | **3** |
+| of the 77 previous events, surviving (±0.3 s) | — | **0** |
+| mean 6-11 kHz drop on the detected frames | — | **-12.3 dB** (p05 -6.3) |
+| 6-11 kHz p95 / max, speech-active frames | -28.2 / -19.6 dBFS | **-37.6 / -27.9 dBFS** |
+| line 2 (the 6.400 s worst case) 6-11 kHz max | -19.2 dBFS | **-29.6 dBFS** |
+| 300-4000 Hz mean, speech-active frames | -30.15 dBFS | -30.15 dBFS (per line <= 0.01 dB) |
+| samples per line | — | identical |
+
+Difference spectrum over the 56 lines: removed energy below 5 kHz is 66.8 dB
+below the removed energy in 5-11.5 kHz — the change is confined to the ducked
+band. Residual: the duck applies to 6.4% of frames (the frames in which the
+6-11 kHz band dominates the speech band — i.e. the fricative/onset frames the
+audit counted), where the fricative's 6-11 kHz part is up to 14 dB darker
+(its body below 5.1 kHz and the whole speech band unchanged). Tunables at the
+top of the module if that trade is too strong: `duck_db`, `min_excess_db`.
+
+Cost: 20.9 ms per 10 s of audio (release, `cargo test -p ptts --release --lib
+hf_burst -- --nocapture`) = 0.21% of realtime; wall-clock A/B on 8 interleaved
+utterances: RTF 0.337 (before) vs 0.321 (after) — inside run-to-run noise.
+
+Tests: 4 unit tests in `ptts/src/hf_burst.rs` (injected burst must drop >= 10 dB
+and the speech band must move < 0.05 dB; speech-only signal must pass within
+1e-4; HF that does not dominate the speech band must be kept within 0.5 dB;
+cost). With `duck_db = 0` the first test fails (-15.2 -> -15.2 dBFS), so it
+does gate the fix.
+
+Deploy: paperradio's `deploy/Dockerfile.xnptts` clones this branch, so the
+container needs `docker compose build --no-cache pocket-tts` +
+`up -d pocket-tts` to pick this up; no flag or compose change (the stage is
+unconditional). Audio already published keeps its bursts.

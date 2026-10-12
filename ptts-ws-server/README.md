@@ -38,9 +38,17 @@ knobs (compose `command` or `docker run` args): `--quant q8_0` (or `q4k` for
 ≈12% more throughput at high concurrency, or `f32` for parity with the old
 image). Recommended cpuset: `--cpuset-cpus=0-15` (physical cores only).
 
-Output handling: raw decoder output (no post-processing — loudness
-normalization and denoising were removed after they proved to overboost and
-clip). Long texts are split into sentence-aligned chunks of at most
+Output handling: raw decoder output with one targeted repair — the decoder
+emits 6-11 kHz noise bursts (20-150 ms, -19..-32 dBFS, 8-30 dB above the
+concurrent speech band) for fricatives, stops and utterance onsets, which the
+paperradio listener audit counted 86-88 times per episode. `ptts::hf_burst`
+ducks that band by 14 dB in the frames that carry such a burst (nothing below
+~5.2 kHz is touched, so the 300-4000 Hz speech band and the 4-6 kHz fricative
+body are unchanged; the duck is bounded, so the phoneme keeps its level and
+duration). Loudness normalization and denoising were removed earlier after
+they proved to overboost and clip — this stage is neither: it is a per-frame
+band duck keyed by the burst's own level. Long texts are split into
+sentence-aligned chunks of at most
 `--max-tokens-per-chunk` tokens (default 150; mirrors pip pocket-tts
 chunking — without it, long paragraphs degrade into stuttering noise:
 measured 146s of -40dB-noise audio vs 79s clean on the same 433-token text).
