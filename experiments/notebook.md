@@ -336,3 +336,35 @@ Deploy: paperradio's `deploy/Dockerfile.xnptts` clones this branch, so the
 container needs `docker compose build --no-cache pocket-tts` +
 `up -d pocket-tts` to pick this up; no flag or compose change (the stage is
 unconditional). Audio already published keeps its bursts.
+
+### Codec matrix: does the duck survive paperradio's encoders?
+Same 56 lines, same input, measured after encoding exactly as paperradio's
+`finalize.rs` does (TTS PCM -> 48 kHz s16le -> `libmp3lame -b:a 48k` CBR mono;
+`libopus -b:a 32k -ac 1 -vbr on`), decoded back and measured with the same
+detector. Per-frame excess = 6-11 kHz minus 300-4000 Hz on frames whose
+6-11 kHz band is over -35 dBFS; tonality = local-median spectral excess
+(5.5-12.5 kHz); events = the paperradio burst count over the 56 lines.
+
+| variant | excess mean | p50 | p95 | 6-11k max | tonality p50 | p90 | max | events |
+|---|---|---|---|---|---|---|---|---|
+| raw TTS (24 kHz) | 15.4 | 19.1 | 28.8 | -16.0 | 9.9 | 11.9 | 18.2 | 77 |
+| ducked (24 kHz) | 0.3 | -2.4 | 14.8 | -21.8 | 10.0 | 12.1 | 18.2 | 3 |
+| raw + mp3 48k CBR | 14.8 | 18.6 | 29.0 | -15.9 | 19.1 | 32.4 | 67.4 | 276 |
+| ducked + mp3 48k | 0.1 | -2.4 | 15.4 | -20.4 | 20.3 | 32.8 | 67.4 | 3 |
+| raw + opus 32k VBR | 17.9 | 21.3 | 30.7 | -16.3 | 11.2 | 14.6 | 25.9 | 181 |
+| ducked + opus 32k | 0.9 | -2.4 | 17.7 | -24.2 | 11.3 | 14.6 | 24.5 | 1 |
+
+Two separate conclusions:
+1. The duck survives the codecs: the excess paperradio measured goes
+   14.8 -> 0.1 dB (mp3) and 17.9 -> 0.9 dB (opus), the loudest 6-11 kHz frame
+   -15.9 -> -20.4 (mp3) / -16.3 -> -24.2 (opus), and their event count
+   276 -> 3 (mp3) / 181 -> 1 (opus). Note the mp3 nearly quadruples the event
+   count on unfiltered audio (77 -> 276): the codec pushes frames into the
+   detector's level/ratio window.
+2. The encoder's own contribution is NOT reduced by the duck: the 48 kbps mp3
+   adds the same spectral-line excess to raw and to ducked audio
+   (+9.2/+20.5/+49.2 dB p50/p90/max on raw, +10.3/+20.7/+49.2 on ducked;
+   identical 67.4 dB worst case). Opus at 32 kbps adds far less (+1.3/+2.5/+7.7).
+   So the residual tonality in the shipped episode is an egress-bitrate
+   decision for paperradio (`audio.episode_kbps`, default 48; some episodes
+   already ship at 96), not something the TTS stage can remove.
